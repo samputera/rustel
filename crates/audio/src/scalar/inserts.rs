@@ -905,7 +905,7 @@ impl ScalarBackend {
     }
 
     /// Retracts the early delivery when the host retires a pending onset.
-    pub(super) fn cancel_inserts_early<K>(&mut self, event: &OnsetEvent<K>, at_frame: u64) {
+    pub(super) fn cancel_inserts_early<K>(&mut self, event: &OnsetEvent<K>) {
         if !event
             .controls
             .instrument
@@ -923,10 +923,6 @@ impl ScalarBackend {
         else {
             return;
         };
-        let frames = event
-            .onset_frame
-            .saturating_sub(at_frame)
-            .min(u64::from(u32::MAX)) as u32;
         let effects = event
             .controls
             .effects
@@ -961,7 +957,7 @@ impl ScalarBackend {
                     && insert.key() == wanted.key
                     && insert.renders_ahead()
                 {
-                    insert.cancel_score(score, frames);
+                    insert.cancel_score(score);
                 }
             }
         }
@@ -1026,7 +1022,7 @@ mod tests {
             fn score(&mut self, id: u64, frames: u32) {
                 self.notes.lock().unwrap().push((id, frames));
             }
-            fn cancel_score(&mut self, id: u64, _: u32) {
+            fn cancel_score(&mut self, id: u64) {
                 self.notes.lock().unwrap().retain(|(held, _)| *held != id);
             }
         }

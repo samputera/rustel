@@ -1121,12 +1121,6 @@ impl ScalarBackend {
     /// The stop ramp calls this for each of its blocks, so nothing new
     /// starts under the ramp. The call also sets the clock to `frame`.
     pub fn retire_pending_at(&mut self, frame: u64) {
-        for position in 0..self.pending.order.len() {
-            let index = self.pending.order[position];
-            if let Some(event) = self.pending.slots[index].event {
-                self.cancel_inserts_early(&event, frame);
-            }
-        }
         self.pending.clear();
         self.frame = frame;
     }
@@ -1312,7 +1306,7 @@ impl ScalarBackend {
                 && !event.controls.piano
                 && event.onset_frame >= horizon(event.generation)
             {
-                self.cancel_inserts_early(&event, at_frame);
+                self.cancel_inserts_early(&event);
             }
         }
         #[cfg(feature = "device-audio")]

@@ -209,7 +209,8 @@ impl Program {
         self.counters.starved_frames.load(Ordering::Relaxed)
     }
 
-    /// Commands refused because a worker left its queue full.
+    /// Commands and cancellations refused because their bounded worker queues
+    /// were full. Refused cancellations never reset the orchestra.
     pub fn refused_commands(&self) -> u64 {
         self.counters.refused_commands.load(Ordering::Relaxed)
     }

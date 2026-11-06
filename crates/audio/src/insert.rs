@@ -287,10 +287,10 @@ pub trait OrbitInsert: Send {
     /// Starts a prepared score event `frames` from now.
     fn score(&mut self, _score: u64, _frames: u32) {}
 
-    /// Cancels a prepared score onset previously delivered to this insert.
-    /// `frames` is the onset's offset from the current block. Notes that
-    /// started before this onset keep their tails where possible.
-    fn cancel_score(&mut self, _score: u64, _frames: u32) {}
+    /// Retracts a prepared score event that has not started rendering.
+    /// Unknown or already-started IDs do nothing; cancellation never cuts
+    /// other notes.
+    fn cancel_score(&mut self, _score: u64) {}
 
     /// Ends each note `frames` from now: a note that sounds then, and a
     /// note that starts before then. A rewind cuts the engine voices at the

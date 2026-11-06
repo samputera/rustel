@@ -116,10 +116,10 @@ fn cancelled_prefetched_onsets_leave_started_tails_and_replacements_alone() {
         insert.process(&mut left, &mut right);
         // Cancellation on a copy that never received this ID is inert.
         let first_new = prepare(replacement_pitch, 0.001);
-        insert.cancel_score(first_new, 0);
+        insert.cancel_score(first_new);
         for (index, id) in old.iter().enumerate() {
             let due = 512 + index as u32 * 640;
-            insert.cancel_score(*id, due);
+            insert.cancel_score(*id);
             let replacement = if index == 0 {
                 first_new
             } else {
@@ -151,34 +151,57 @@ fn cancelled_prefetched_onsets_leave_started_tails_and_replacements_alone() {
 }
 
 #[test]
-fn cancellation_masks_an_obsolete_onset_already_rendered_into_the_runway() {
+fn cancellation_preserves_already_rendered_notes_and_unrelated_tails() {
     let _serial = serial();
-    let Some(program) = program("instr probe\naSignal init p5\nouts aSignal,aSignal\nendin") else {
+    let Some(program) =
+        program("instr probe\naSignal init p4 / 10000\nouts aSignal,aSignal\nendin")
+    else {
         return;
     };
-    let mut insert = program.instance(48_000).unwrap();
-    let old = program.prepare(event("probe", 1.0)).unwrap();
-    insert.score(old, 640);
-    // Render the obsolete onset without consuming its audio, then retract it.
-    insert.flush(768);
-    insert.cancel_score(old, 640);
-    insert.score(program.prepare(event("probe", 0.001)).unwrap(), 1024);
-    insert.flush(1152);
-    let mut recording = Vec::with_capacity(9 * BLOCK);
-    let before = Violations::capture();
-    tripwire::audio_scope(|| {
-        for _ in 0..9 {
-            let mut left = [0.0; BLOCK];
-            let mut right = [0.0; BLOCK];
-            insert.process(&mut left, &mut right);
-            recording.extend_from_slice(&left);
+    for replacement_due in [640_u32, 1024] {
+        let mut insert = program.instance(48_000).unwrap();
+        let prepare = |pitch, duration| {
+            let mut note = event("probe", duration);
+            note.p4 = pitch;
+            program.prepare(note).unwrap()
+        };
+        insert.score(prepare(100.0, 1.0), 0);
+        let old = prepare(65.4, 1.0);
+        insert.score(old, 640);
+        // These notes have started rendering. Cancellation must leave both the
+        // mixed audio already in the ring and their subsequent tails intact.
+        insert.flush(768);
+        insert.cancel_score(old);
+        insert.score(prepare(261.6, 0.001), replacement_due);
+        insert.flush(1152);
+        let mut recording = Vec::with_capacity(9 * BLOCK);
+        let before = Violations::capture();
+        tripwire::audio_scope(|| {
+            for _ in 0..9 {
+                let mut left = [0.0; BLOCK];
+                let mut right = [0.0; BLOCK];
+                insert.process(&mut left, &mut right);
+                recording.extend_from_slice(&left);
+            }
+        });
+        assert!(Violations::capture().since(before).clean());
+        // A late replacement keeps the existing frontier behavior; cancellation
+        // must neither delay it further nor restart the earlier notes.
+        let onset = replacement_due.max(768) as usize;
+        for (frame, expected) in [
+            (632, 0.01),
+            (648, 0.01654),
+            (onset + 8, 0.04270),
+            (onset + 80, 0.01654),
+        ] {
+            assert!(
+                (recording[frame] - expected).abs() < 1e-6,
+                "replacement {replacement_due}, frame {frame}: {} != {expected}",
+                recording[frame]
+            );
         }
-    });
-    assert!(Violations::capture().since(before).clean());
-    assert!(recording[..1024].iter().all(|sample| *sample == 0.0));
-    assert!((recording[1032] - 0.2).abs() < 1e-6);
-    assert!(recording[1100..].iter().all(|sample| *sample == 0.0));
-    assert!(errors(&program).is_empty());
+        assert!(errors(&program).is_empty());
+    }
 }
 
 #[test]
