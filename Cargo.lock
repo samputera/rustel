@@ -4623,13 +4623,13 @@ dependencies = [
  "rustel-runtime",
  "rustel-scheduler",
  "rustel-serial",
+ "rustel-studio-themes",
  "rustel-transpiler",
  "rustel-voice",
  "rustel-vst3-fixture",
  "serde",
  "serde_json",
  "softbuffer",
- "tachyonfx",
  "tempfile",
  "termina",
  "unicode-segmentation",
@@ -4655,6 +4655,17 @@ dependencies = [
  "serde_json",
  "similar",
  "tempfile",
+]
+
+[[package]]
+name = "rustel-studio-themes"
+version = "0.2.0"
+source = "git+https://github.com/tzfm/rustel-studio-themes.git?tag=v0.2.0#7c0c9bf9c711da823d6dbd1bd043e66882217b2a"
+dependencies = [
+ "ratatui",
+ "serde",
+ "tachyonfx",
+ "unicode-width",
 ]
 
 [[package]]

@@ -802,13 +802,17 @@ Press Ctrl+T to choose a theme. Type to search, use arrows to select, and press
 Enter to keep the selection. Ctrl+N creates a user theme. Ctrl+E edits one; an
 edit to a built-in theme creates a user copy. Ctrl+D asks to delete a user theme.
 
+The theme documents, except rustel-dark, and the Rust that draws them, live in
+[rustel-studio-themes](https://github.com/tzfm/rustel-studio-themes).
+The default build includes the extra documents. A build without the `themes` feature keeps `rustel-dark`.
+
 User themes are JSON files in `<rustel-config>/themes/`. `--theme` accepts a
 theme name or a path to a theme file, such as `--theme ./midnight.json`. You
 can list themes or select one at startup:
 
 ```sh
 rustel studio --list-themes
-rustel studio --theme strudel song.strudel
+rustel studio --theme rustel-dark song.strudel
 ```
 
 ### Minimal user theme

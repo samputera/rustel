@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- The studio themes, except rustel-dark, live in [rustel-studio-themes](https://github.com/tzfm/rustel-studio-themes). A build without the `themes` feature keeps rustel-dark.
 - A video file plays as a sample: `mp4`, `m4v`, `mov`, `mkv` and `webm` play their audio track.
 - `_video()` and `video()` draw a video sample's picture in sync with its sound. H.264, HEVC, AV1, VP9, VP8 and Motion JPEG decode natively.
 - The visuals docks have a video widget for the clips of `_video()` and `video()` lanes. Enter opens the clip in a desktop window.
