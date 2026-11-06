@@ -50,6 +50,8 @@ const COMMAND_CAPACITY: u64 = 256;
 enum Command {
     /// Plays the prepared score event `id` at frame `due`.
     Score { id: u64, due: u64 },
+    /// Retracts one host onset, preserving tails unless it is already rendered.
+    Cancel { id: u64, due: u64, mask: usize },
     /// Ends every note, also those the orchestra scheduled itself or the
     /// host still had waiting, and restarts the orchestra at frame `due`.
     Cut { due: u64, mask: usize },
@@ -228,6 +230,7 @@ impl Insert {
                     engine: Some(engine),
                     pending: Vec::new(),
                     pending_bytes: 0,
+                    started_scores: Vec::new(),
                     write: 0,
                 };
                 if ready.send(Ok(())).is_err() {
@@ -283,7 +286,7 @@ impl Insert {
     fn try_post(&mut self, command: Command) -> bool {
         let (due, reset) = match command {
             Command::Score { .. } => return self.channel.post(command),
-            Command::Cut { due, .. } => (due, false),
+            Command::Cut { due, .. } | Command::Cancel { due, .. } => (due, false),
             Command::Reset { due, .. } => (due, true),
         };
         let Some(mask) = self.masks.iter().position(Option::is_none) else {
@@ -292,6 +295,8 @@ impl Insert {
         self.channel.clean_from[mask].store(u64::MAX, Ordering::Relaxed);
         let command = if reset {
             Command::Reset { due, mask }
+        } else if let Command::Cancel { id, .. } = command {
+            Command::Cancel { id, due, mask }
         } else {
             Command::Cut { due, mask }
         };
@@ -332,9 +337,15 @@ impl Insert {
             .fetch_add(1, Ordering::Relaxed);
         // A refused score can stay silent. A cut must reach the worker
         // before another score, or its stale-frame mask would never end.
+        // Under pressure, a reset replaces a refused cancellation so the
+        // worker cannot keep an obsolete onset. It may also end note tails.
+        let command = match command {
+            Command::Cancel { due, .. } => Command::Reset { due, mask: 0 },
+            other => other,
+        };
         let (due, reset) = match command {
             Command::Score { .. } => return,
-            Command::Cut { due, .. } => (due, false),
+            Command::Cut { due, .. } | Command::Cancel { due, .. } => (due, false),
             Command::Reset { due, .. } => (due, true),
         };
         self.pending_control = Some(match self.pending_control {
@@ -369,6 +380,11 @@ impl OrbitInsert for Insert {
             .lead
             .fetch_max(u64::from(frames), Ordering::Release);
         self.post(Command::Score { id, due });
+    }
+
+    fn cancel_score(&mut self, id: u64, frames: u32) {
+        let due = self.frame.saturating_add(u64::from(frames));
+        self.post(Command::Cancel { id, due, mask: 0 });
     }
 
     fn cut_notes(&mut self, frames: u32) {
@@ -416,7 +432,9 @@ impl OrbitInsert for Insert {
             .flatten()
             .copied()
             .chain(self.pending_control.map(|command| match command {
-                Command::Cut { due, .. } | Command::Reset { due, .. } => due,
+                Command::Cut { due, .. }
+                | Command::Reset { due, .. }
+                | Command::Cancel { due, .. } => due,
                 Command::Score { .. } => unreachable!(),
             }))
             .min();
@@ -502,7 +520,7 @@ impl Drop for Insert {
 }
 
 enum Action {
-    Score(String),
+    Score { id: u64, score: String },
     Cut,
 }
 
@@ -518,6 +536,9 @@ struct State {
     engine: Option<Engine>,
     pending: Vec<Scheduled>,
     pending_bytes: usize,
+    /// Onsets rendered into unread audio. IDs let a cancellation distinguish
+    /// a rendered onset from a score this copy never received.
+    started_scores: Vec<(u64, u64)>,
     /// The frame the worker renders next. It only moves forward.
     write: u64,
 }
@@ -525,6 +546,7 @@ struct State {
 impl State {
     fn run(&mut self) {
         let mut spins = 0u16;
+        let mut last_read = u64::MAX;
         loop {
             if self.channel.stopping.load(Ordering::Acquire) {
                 return;
@@ -553,19 +575,48 @@ impl State {
             } else {
                 read.saturating_add(runway)
             };
+            if read != last_read {
+                self.started_scores.retain(|(_, frame)| *frame >= read);
+                last_read = read;
+            }
             while let Some(command) = self.channel.drain() {
                 match command {
                     Command::Score { id, due } => {
                         if let Some(score) = self.program.take(id)
-                            && let Err(error) = self.schedule(due, Action::Score(score))
+                            && let Err(error) = self.schedule(due, Action::Score { id, score })
                         {
                             self.program.report_error(error);
+                        }
+                    }
+                    Command::Cancel { id, due, mask } => {
+                        self.pending.retain(|event| {
+                            if let Action::Score { id: held, score } = &event.action
+                                && *held == id
+                            {
+                                self.pending_bytes -= score.len();
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        let rendered = self.started_scores.iter().position(|(held, _)| *held == id);
+                        if let Some(position) = rendered {
+                            self.started_scores.swap_remove(position);
+                            // The worker may already have rendered this onset
+                            // into unread audio. Retire that interval just as
+                            // a cut does; the stale onset cannot ring out.
+                            let _ = self.engine.take();
+                            self.confirm_cut(mask, due);
+                        } else {
+                            // No rendered audio changed. In particular, the
+                            // orchestra keeps the tails that started earlier.
+                            self.channel.clean_from[mask].store(due, Ordering::Release);
                         }
                     }
                     Command::Cut { due, mask } => {
                         self.pending.retain(|event| {
                             if event.frame >= due
-                                && let Action::Score(score) = &event.action
+                                && let Action::Score { score, .. } = &event.action
                             {
                                 self.pending_bytes -= score.len();
                                 false
@@ -615,7 +666,7 @@ impl State {
 
     fn schedule(&mut self, due: u64, action: Action) -> Result<(), String> {
         let bytes = match &action {
-            Action::Score(score) => score.len(),
+            Action::Score { score, .. } => score.len(),
             Action::Cut => 0,
         };
         if matches!(action, Action::Cut) && self.pending.len() >= super::MAX_EVENTS {
@@ -623,8 +674,8 @@ impl State {
             if let Some(position) = self
                 .pending
                 .iter()
-                .rposition(|event| matches!(event.action, Action::Score(_)))
-                && let Action::Score(score) = self.pending.remove(position).action
+                .rposition(|event| matches!(event.action, Action::Score { .. }))
+                && let Action::Score { score, .. } = self.pending.remove(position).action
             {
                 self.pending_bytes -= score.len();
                 self.program.report_error(error);
@@ -654,7 +705,7 @@ impl State {
             && let Some(onset) = self
                 .pending
                 .iter()
-                .find(|event| matches!(event.action, Action::Score(_)))
+                .find(|event| matches!(event.action, Action::Score { .. }))
                 .map(|event| event.frame)
         {
             // A cut took the orchestra, and a note has asked for it again.
@@ -672,8 +723,13 @@ impl State {
             .is_some_and(|event| event.frame <= self.write)
         {
             match self.pending.remove(0).action {
-                Action::Score(score) => {
+                Action::Score { id, score } => {
                     self.pending_bytes -= score.len();
+                    if self.started_scores.len() == super::MAX_EVENTS {
+                        self.fail("Csound rendered event limit reached".into());
+                        continue;
+                    }
+                    self.started_scores.push((id, self.write));
                     if self.engine.is_none()
                         && let Err(error) = self.start_orchestra(self.write)
                     {
@@ -820,6 +876,7 @@ mod tests {
                     engine: None,
                     pending: Vec::new(),
                     pending_bytes: 0,
+                    started_scores: Vec::new(),
                     write: 0,
                 }
                 .run();
@@ -1070,7 +1127,9 @@ mod tests {
             insert.reset();
             while let Some(command) = channel.drain() {
                 match command {
-                    Command::Cut { due, mask } | Command::Reset { due, mask } => {
+                    Command::Cut { due, mask }
+                    | Command::Reset { due, mask }
+                    | Command::Cancel { due, mask, .. } => {
                         confirm_cut(&channel, mask, due);
                     }
                     Command::Score { .. } => unreachable!(),
@@ -1086,6 +1145,31 @@ mod tests {
         }
         insert.flush(0);
         assert!(insert.pending_control.is_none());
+    }
+
+    #[test]
+    fn a_refused_cancellation_retires_stale_audio_before_accepting_more_scores() {
+        let channel = Arc::new(Channel::new());
+        fill_ahead(&channel, 1024);
+        let mut insert = reader(&channel);
+        for id in 0..COMMAND_CAPACITY {
+            assert!(channel.post(Command::Score { id, due: 512 }));
+        }
+        insert.cancel_score(7, 256);
+        assert_eq!(
+            insert.pending_control,
+            Some(Command::Reset { due: 256, mask: 0 })
+        );
+        while channel.drain().is_some() {}
+        insert.score(999, 768);
+        let mask = take_control(&channel, 256, true);
+        assert_eq!(channel.drain(), Some(Command::Score { id: 999, due: 768 }));
+        confirm_cut(&channel, mask, 512);
+        play_block(&mut insert);
+        play_block(&mut insert);
+        assert!(play_block(&mut insert).iter().all(|sample| *sample == 0.0));
+        assert!(play_block(&mut insert).iter().all(|sample| *sample == 0.0));
+        assert_eq!(play_block(&mut insert).first(), Some(&512.0));
     }
 
     #[test]
@@ -1124,12 +1208,13 @@ mod tests {
             engine: None,
             pending: Vec::new(),
             pending_bytes: 0,
+            started_scores: Vec::new(),
             write: 300,
         };
         let score = "i \"triangle\" 0 0.1 440 0.2 \"\"\n".to_owned();
         // The note sounds past the frontier, and the frames before it are
         // silent.
-        state.schedule(900, Action::Score(score)).unwrap();
+        state.schedule(900, Action::Score { id: 1, score }).unwrap();
         // The mark comes before the compile, which fails with no library.
         state.step();
         assert_eq!(channel.started.load(Ordering::Acquire), 900);

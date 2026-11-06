@@ -904,6 +904,69 @@ impl ScalarBackend {
         }
     }
 
+    /// Retracts the early delivery when the host retires a pending onset.
+    pub(super) fn cancel_inserts_early<K>(&mut self, event: &OnsetEvent<K>, at_frame: u64) {
+        if !event
+            .controls
+            .instrument
+            .iter()
+            .chain(event.controls.effects.iter().flatten())
+            .any(|wanted| wanted.score().is_some())
+        {
+            return;
+        }
+        let chain = event.controls.insert_chain();
+        let Some(bus) = self
+            .insert_chains
+            .iter()
+            .position(|held| *held == Some(chain))
+        else {
+            return;
+        };
+        let frames = event
+            .onset_frame
+            .saturating_sub(at_frame)
+            .min(u64::from(u32::MAX)) as u32;
+        let effects = event
+            .controls
+            .effects
+            .iter()
+            .enumerate()
+            .filter_map(|(place, wanted)| {
+                wanted.as_ref().map(|wanted| {
+                    (
+                        crate::insert::effect_slot(chain, wanted.stage(place)),
+                        wanted,
+                    )
+                })
+            });
+        let instrument = event
+            .controls
+            .instrument
+            .as_ref()
+            .map(|wanted| (crate::insert::instrument_slot(chain), wanted));
+        for (logical, wanted) in effects.chain(instrument) {
+            let Some(score) = wanted.score() else {
+                continue;
+            };
+            let slot = logical.physical(bus);
+            // A copy may have moved since admission, so retract the score
+            // from every matching copy. Cancellation of an unknown ID is inert.
+            for inserts in [
+                &mut self.orbit_inserts,
+                &mut self.prepared_inserts,
+                &mut self.leaving_inserts,
+            ] {
+                if let Some(insert) = inserts.get_mut(slot).and_then(Option::as_mut)
+                    && insert.key() == wanted.key
+                    && insert.renders_ahead()
+                {
+                    insert.cancel_score(score, frames);
+                }
+            }
+        }
+    }
+
     /// Delivers one note of `generation` to the box that will play it: the
     /// held box when it is the wanted one, else the prepared box activation
     /// swaps in.
@@ -941,6 +1004,97 @@ impl ScalarBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retiring_prefetched_scores_cancels_only_replaced_onsets() {
+        use crate::{AudioBackend, InsertControls, InsertKey, OrbitInsert};
+        use std::sync::{Arc, Mutex};
+
+        struct Scheduled {
+            key: InsertKey,
+            notes: Arc<Mutex<Vec<(u64, u32)>>>,
+        }
+        impl OrbitInsert for Scheduled {
+            fn key(&self) -> InsertKey {
+                self.key
+            }
+            fn set_param(&mut self, _: crate::InsertParam, _: u32) {}
+            fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
+            fn renders_ahead(&self) -> bool {
+                true
+            }
+            fn score(&mut self, id: u64, frames: u32) {
+                self.notes.lock().unwrap().push((id, frames));
+            }
+            fn cancel_score(&mut self, id: u64, _: u32) {
+                self.notes.lock().unwrap().retain(|(held, _)| *held != id);
+            }
+        }
+        for location in 0..3 {
+            let key = InsertKey {
+                plugin: u32::MAX,
+                preset: 1,
+            };
+            let notes = Arc::new(Mutex::new(Vec::with_capacity(16)));
+            let mut backend = ScalarBackend::prepared(48_000, 16).unwrap();
+            assert!(
+                backend
+                    .install_insert(
+                        crate::instrument_slot(1),
+                        Box::new(Scheduled {
+                            key,
+                            notes: Arc::clone(&notes),
+                        })
+                    )
+                    .is_none()
+            );
+            let event = |id, frame| {
+                let mut event: OnsetEvent =
+                    OnsetEvent::new(frame, 65.4, 0.9, 0.025).with_generation(1);
+                event.controls.insert_chain = Some(1);
+                event.controls.instrument = Some(InsertControls::new(key).with_score(id));
+                event
+            };
+            for (id, frame) in [(1, 128), (2, 640), (3, 1280), (4, 1920), (5, 2560)] {
+                let event = event(id, frame);
+                backend.notify_inserts_early(&event, 0);
+                backend.note(event);
+            }
+            let bus = backend
+                .insert_chains
+                .iter()
+                .position(|held| *held == Some(1))
+                .unwrap();
+            let slot = crate::instrument_slot(1).physical(bus);
+            // Replacement can move a copy after its early score delivery.
+            match location {
+                1 => backend.prepared_inserts[slot] = backend.orbit_inserts[slot].take(),
+                2 => backend.leaving_inserts[slot] = backend.orbit_inserts[slot].take(),
+                _ => {}
+            }
+            let before = crate::tripwire::Violations::capture();
+            crate::tripwire::audio_scope(|| backend.hand_over_from(2, 640, 0));
+            assert!(crate::tripwire::Violations::capture().since(before).clean());
+            assert_eq!(
+                *notes.lock().unwrap(),
+                [(1, 128)],
+                "old-generation onsets survive the handoff"
+            );
+            if location == 2 {
+                backend.orbit_inserts[slot] = backend.leaving_inserts[slot].take();
+            }
+            for (id, frame) in [(6, 640), (7, 1280), (8, 1920), (9, 2560)] {
+                let mut event = event(id, frame);
+                event.generation = 2;
+                backend.notify_inserts_early(&event, 0);
+                backend.note(event);
+            }
+            assert_eq!(
+                *notes.lock().unwrap(),
+                [(1, 128), (6, 640), (7, 1280), (8, 1920), (9, 2560)]
+            );
+        }
+    }
     mod insert_routing_tests {
         use super::*;
         use crate::insert::{InsertControls, InsertKey, InsertNote, InsertParam, OrbitInsert};

@@ -89,6 +89,99 @@ fn errors(program: &Program) -> Vec<String> {
 }
 
 #[test]
+fn cancelled_prefetched_onsets_leave_started_tails_and_replacements_alone() {
+    let _serial = serial();
+    let Some(program) =
+        program("instr probe\naSignal init p4 / 10000\nouts aSignal,aSignal\nendin")
+    else {
+        return;
+    };
+    for replacement_pitch in [65.4, 261.6] {
+        let mut insert = program.instance(48_000).unwrap();
+        let prepare = |pitch, duration| {
+            let mut note = event("probe", duration);
+            note.p4 = pitch;
+            program.prepare(note).unwrap()
+        };
+        // A held tail must survive the edit. Four old onsets already live
+        // in the worker's schedule when the host retires them.
+        insert.score(prepare(100.0, 1.0), 0);
+        let old: Vec<_> = (0..4).map(|_| prepare(65.4, 0.001)).collect();
+        for (index, id) in old.iter().enumerate() {
+            insert.score(*id, 640 + index as u32 * 640);
+        }
+        insert.flush(BLOCK);
+        let mut left = [0.0; BLOCK];
+        let mut right = [0.0; BLOCK];
+        insert.process(&mut left, &mut right);
+        // Cancellation on a copy that never received this ID is inert.
+        let first_new = prepare(replacement_pitch, 0.001);
+        insert.cancel_score(first_new, 0);
+        for (index, id) in old.iter().enumerate() {
+            let due = 512 + index as u32 * 640;
+            insert.cancel_score(*id, due);
+            let replacement = if index == 0 {
+                first_new
+            } else {
+                prepare(replacement_pitch, 0.001)
+            };
+            insert.score(replacement, due);
+        }
+        let mut recording = Vec::new();
+        for _ in 0..24 {
+            insert.flush(BLOCK);
+            insert.process(&mut left, &mut right);
+            recording.extend_from_slice(&left);
+        }
+        for index in 0..4 {
+            let onset = 512 + index * 640;
+            let expected = 0.01 + replacement_pitch as f32 / 10000.0;
+            assert!(
+                (recording[onset + 8] - expected).abs() < 1e-6,
+                "replacement {replacement_pitch}, onset {index}: {} != {expected}",
+                recording[onset + 8]
+            );
+            assert!(
+                (recording[onset + 128] - 0.01).abs() < 1e-6,
+                "started tail was cut"
+            );
+        }
+        assert!(errors(&program).is_empty());
+    }
+}
+
+#[test]
+fn cancellation_masks_an_obsolete_onset_already_rendered_into_the_runway() {
+    let _serial = serial();
+    let Some(program) = program("instr probe\naSignal init p5\nouts aSignal,aSignal\nendin") else {
+        return;
+    };
+    let mut insert = program.instance(48_000).unwrap();
+    let old = program.prepare(event("probe", 1.0)).unwrap();
+    insert.score(old, 640);
+    // Render the obsolete onset without consuming its audio, then retract it.
+    insert.flush(768);
+    insert.cancel_score(old, 640);
+    insert.score(program.prepare(event("probe", 0.001)).unwrap(), 1024);
+    insert.flush(1152);
+    let mut recording = Vec::with_capacity(9 * BLOCK);
+    let before = Violations::capture();
+    tripwire::audio_scope(|| {
+        for _ in 0..9 {
+            let mut left = [0.0; BLOCK];
+            let mut right = [0.0; BLOCK];
+            insert.process(&mut left, &mut right);
+            recording.extend_from_slice(&left);
+        }
+    });
+    assert!(Violations::capture().since(before).clean());
+    assert!(recording[..1024].iter().all(|sample| *sample == 0.0));
+    assert!((recording[1032] - 0.2).abs() < 1e-6);
+    assert!(recording[1100..].iter().all(|sample| *sample == 0.0));
+    assert!(errors(&program).is_empty());
+}
+
+#[test]
 fn native_timing_cut_nested_notes_reset_and_callback_allocation() {
     let _serial = serial();
     let Some(program) = program(
