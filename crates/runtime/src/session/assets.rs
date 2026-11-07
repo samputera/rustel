@@ -382,7 +382,19 @@ impl Session {
         let haps = self.window_haps(from_cycle, cycles, ceiling);
         let mut resolved: std::collections::BTreeMap<String, std::collections::BTreeSet<i64>> =
             std::collections::BTreeMap::new();
+        // A dense window plays one sound at many onsets. A name that misses
+        // its exact spelling scans every bank, and one scan per onset held
+        // the engine past a live edit's takeover. Look each sound up once.
+        let mut seen = std::collections::HashSet::new();
         for sound in Self::sounds_in(&haps) {
+            if !seen.insert((
+                sound.s.clone(),
+                sound.banked.clone(),
+                sound.n.to_bits(),
+                sound.midi.to_bits(),
+            )) {
+                continue;
+            }
             // `.bank("tr909")` makes the sound `tr909_bd`. Warming only `bd`
             // fetches a different bank's files, and the lane's first hit is
             // refused. Warm the banked spelling too, as the voice looks it up.
@@ -393,6 +405,13 @@ impl Session {
                 .into_iter()
                 .chain([sound.s.as_str()])
             {
+                // A synth has no file to load or keep. `one` plays a sample
+                // when a bank has one, so it is warmed.
+                if rustel_voice::is_native_synth_sound(name)
+                    && !rustel_voice::native_synth_yields_to_sample(name)
+                {
+                    continue;
+                }
                 let _ = rustel_voice::SampleLookup::resolve(
                     library.as_ref(),
                     name,
@@ -641,6 +660,34 @@ mod tests {
         assert!(
             session.sample_library().is_none(),
             "a denied score-level samples() call initialized an I/O subsystem"
+        );
+    }
+
+    /// A warm loads the samples a window plays and passes over its synths.
+    #[test]
+    fn a_dense_window_warms_its_samples_and_not_its_synths() {
+        let mut session = Session::new().expect("session");
+        let library = Arc::new(crate::samples::SampleLibrary::with_unasked_banks_for_test(
+            &["hh", "one"],
+        ));
+        session.samples = Some(Arc::clone(&library));
+        session
+            .evaluate(r#"stack(note("c d e f").fast(16).s("sawtooth"), s("hh*16 one"))"#)
+            .expect("the score installs");
+
+        let window = session.kick_sample_loads_within(0.0, 4.0, std::time::Duration::from_secs(5));
+
+        assert_eq!(
+            window,
+            [
+                ("hh".to_owned(), crate::sounds::Variants::first()),
+                ("one".to_owned(), crate::sounds::Variants::first()),
+            ]
+        );
+        assert_eq!(
+            library.queued_loads_for_test(),
+            (2, 0),
+            "one load each for hh and one"
         );
     }
 }
