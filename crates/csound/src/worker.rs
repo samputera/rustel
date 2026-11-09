@@ -48,7 +48,12 @@ const COMMAND_CAPACITY: u64 = 256;
 /// Cancellations have their own queue, sized from the existing scheduled-event
 /// and command ceilings. Repeated or unknown IDs share this bound. A full queue
 /// refuses requests without cutting notes, as reported by `refused_commands`.
-const CANCEL_CAPACITY: usize = super::MAX_EVENTS + COMMAND_CAPACITY as usize;
+/// Under Miri the queue is small, because every worker test builds one.
+const CANCEL_CAPACITY: usize = if cfg!(miri) {
+    2 * COMMAND_CAPACITY as usize
+} else {
+    super::MAX_EVENTS + COMMAND_CAPACITY as usize
+};
 
 #[derive(Clone, Copy, Debug)]
 struct Cancellation {
@@ -976,11 +981,7 @@ mod tests {
         }
         assert!(channel.take_cancellation(tail).is_none());
         let writer = Arc::clone(&channel);
-        let count = if cfg!(miri) {
-            16
-        } else {
-            CANCEL_CAPACITY as u64 + 17
-        };
+        let count = CANCEL_CAPACITY as u64 + 17;
         let worker = thread::spawn(move || {
             for id in 0..count {
                 while !writer.cancel(id) {
@@ -1241,6 +1242,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn a_full_command_queue_does_not_turn_cancellation_into_a_reset() {
         let channel = Arc::new(Channel::new());
         let program = Program::without_orchestra();
@@ -1316,6 +1318,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to fill the schedule under Miri")]
     fn cancellation_frees_schedule_capacity_before_admitting_replacement_scores() {
         let channel = Arc::new(Channel::new());
         let program = Program::without_orchestra();
