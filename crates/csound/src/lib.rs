@@ -8,6 +8,10 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: rustel_audio::tripwire::TripwireAlloc = rustel_audio::tripwire::TripwireAlloc;
+
 pub const PLUGIN_ID: u32 = u32::MAX;
 const MAX_EVENTS: usize = 65_536;
 const MAX_EVENT_BYTES: usize = 64 * 1024 * 1024;

@@ -1275,6 +1275,7 @@ mod tests {
             }));
         }
         let mut insert = reader(&channel);
+        assert!(rustel_audio::tripwire::allocator_is_armed());
         let before = rustel_audio::tripwire::Violations::capture();
         // The first note precedes the takeover. Retract every later onset,
         // including more IDs than the full command queue could have held.
