@@ -245,6 +245,14 @@ impl App {
         // worker: the decoders and the fetcher that enforce it run on
         // loader threads with no engine in reach.
         rustel_audio::set_sample_pcm_ceiling(self.ui_settings.sample_ceiling.bytes());
+        let video_ceiling = rustel_runtime::video_file_ceiling();
+        if rustel_runtime::set_video_file_ceiling(self.ui_settings.video_ceiling.bytes())
+            != video_ceiling
+        {
+            // A clip the old ceiling refused is asked for again.
+            #[cfg(feature = "video")]
+            self.visual.forget_failed_videos();
+        }
         self.worker
             .master()
             .set_max_polyphony(self.ui_settings.max_polyphony);
@@ -1693,7 +1701,7 @@ mod tests {
         /// its Hydra siblings do: the switch is the consent, the theme has to
         /// be kept or on the picker, a draft being typed never acquires, and a
         /// score's own picture drawn over the theme's suppresses it.
-        #[cfg(feature = "hydra")]
+        #[cfg(all(feature = "hydra", feature = "themes"))]
         #[test]
         fn the_native_camera_theme_requests_capture_only_while_its_picture_is_visible() {
             let directory = tempfile::tempdir().expect("temp dir");

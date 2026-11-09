@@ -44,6 +44,7 @@ use catalog::*;
 mod loading;
 use loading::*;
 mod lookup;
+pub use lookup::closest_note_key;
 use lookup::*;
 mod manifests;
 pub use cache::{
@@ -57,7 +58,16 @@ pub use catalog::{
 use manifests::*;
 
 mod codecs;
+#[cfg(feature = "video")]
+pub(crate) use codecs::container_video_track_ids;
 mod decode_cache;
+mod facts;
+pub use facts::{SampleFacts, SoundFacts};
+mod file_limit;
+pub(crate) use file_limit::FileLimit;
+pub use file_limit::{
+    DEFAULT_VIDEO_FILE_BYTES, MAX_VIDEO_FILE_BYTES, set_video_file_ceiling, video_file_ceiling,
+};
 mod folders;
 mod font_queue;
 mod local_names;
@@ -128,7 +138,8 @@ const SCORE_CACHE_KEY_DOMAIN_V1: &[u8] = b"strudel-score-cache-v1\0";
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScoreSampleAccess {
     local_root: Option<Arc<crate::sample_server::ServedRoot>>,
-    sources: Vec<SourceRule>,
+    /// Shared by each address it allows, which judges its redirects by it.
+    sources: Arc<[SourceRule]>,
     refused: RefusedSources,
 }
 
@@ -177,12 +188,22 @@ impl std::fmt::Debug for RefusedSources {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ScoreFetchAccess {
-    /// An address the policy allows, and the source that allows it. Every
-    /// redirect must stay inside that source.
-    Remote { rule: SourceRule },
+    /// An address the policy allows, and the sources of that policy. Every
+    /// redirect must reach an address one of them allows, as the score
+    /// could name that address itself.
+    Remote { sources: Arc<[SourceRule]> },
     Local {
         root: Arc<crate::sample_server::ServedRoot>,
     },
+    /// An address whose source the host took back. It is not read again.
+    Withdrawn,
+}
+
+impl ScoreFetchAccess {
+    /// Whether a source of a remote grant allows `url`.
+    fn allows(&self, url: &Url) -> bool {
+        matches!(self, Self::Remote { sources } if sources.iter().any(|rule| rule.allows(url)))
+    }
 }
 
 use crate::sample_fetch;
@@ -923,12 +944,26 @@ struct Shared {
     /// pack is granted no less than a score would be: the exact origin the
     /// player typed on top of it.
     import_policy: Mutex<Option<ScoreSampleAccess>>,
+    /// The score policy the last [`SampleLibrary::withdraw_sources`] took.
+    /// A registration armed under an older policy publishes its grants
+    /// under this one.
+    score_policy: Mutex<Option<ScoreSampleAccess>>,
     font_jobs: Arc<FontQueue>,
     /// One loud log line per failed url, never per onset.
     failures: Mutex<Vec<SampleFailure>>,
     /// Full-screen clients own the terminal and suppress informational
     /// loader writes; failures still travel through `failures` above.
     direct_diagnostic_logging: AtomicBool,
+    /// A video container's picture, as thumbnails, by url. One decode per
+    /// url: the first ask starts it on a library thread, later asks read
+    /// it. Kept for the `video()` painters; nothing else reads a
+    /// container's picture.
+    #[cfg(feature = "video")]
+    videos: Mutex<HashMap<Arc<str>, crate::video::VideoPicture>>,
+    /// The video ceiling's moves the table has seen. A move clears the
+    /// table's refusals, so a clip the old ceiling refused is decoded again.
+    #[cfg(feature = "video")]
+    video_ceiling_seen: AtomicU64,
     /// Persistent score-selected bytes have their own namespace and budget.
     /// One library belongs to one Session, so this also owns that Session's
     /// share of the process-independent cache allowance.
@@ -1464,6 +1499,11 @@ enum Codec {
     Wav,
     Mp3,
     Ogg,
+    /// An ISO base media container: MP4, M4V or QuickTime. The sound is
+    /// its audio track.
+    Mp4,
+    /// A Matroska or WebM container. The sound is its audio track.
+    Matroska,
 }
 
 /// Take `count` slots of the sample bank: ids handed back through
@@ -1584,6 +1624,8 @@ pub(crate) enum SampleAudioKind {
     Wav,
     Mp3,
     Ogg,
+    Mp4,
+    Matroska,
 }
 
 pub(crate) const MAX_SAMPLE_MANIFEST_ENTRIES: usize = 16_384;
@@ -2071,11 +2113,16 @@ pub(crate) mod wait_tests {
     //! Offline sample waits stop without making the loader finish its work.
 
     use std::cell::RefCell;
+    use std::path::Path;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::time::Duration;
 
+    use rustel_scheduler::Transport;
+
     use super::SampleLibrary;
+    use crate::render::RenderStop;
 
     thread_local! {
         static WAIT_ENTERED: RefCell<Option<Sender<()>>> = const { RefCell::new(None) };
@@ -2098,77 +2145,169 @@ pub(crate) mod wait_tests {
         });
     }
 
-    fn assert_empty_render_cancels(cancel_during_wait: bool) {
-        let library = SampleLibrary::empty();
-        let hold = library.hold_manifest_worker_for_test();
-        let cancellation = AtomicBool::new(!cancel_during_wait);
-        let folder = tempfile::tempdir().expect("render directory");
-        let path = folder.path().join("cancelled.wav");
-        let (finished, completion) = mpsc::channel();
-        let (watching, watch) = mpsc::channel();
+    /// The doors of an offline render that wait for their samples.
+    #[derive(Clone, Copy, Debug)]
+    enum Door {
+        Wav,
+        InMemory,
+        #[cfg(feature = "mp3-export")]
+        Mp3,
+    }
 
-        let (result, entered, pending) = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                if cancel_during_wait {
-                    watching.send(watch_next_wait()).expect("wait observer");
-                }
-                let rendered = crate::render::write_scalar_wav_controlled_with_dispatch(
-                    &path,
-                    48_000,
-                    0.1,
-                    &[],
-                    0.5,
-                    Some(&library),
-                    false,
-                    rustel_audio::RenderControl {
-                        cancelled: Some(&cancellation),
-                        ..Default::default()
-                    },
-                    rustel_audio::WavSampleFormat::Pcm16,
-                    rustel_audio::DspDispatch::portable(),
-                    128,
-                    None,
-                    false,
-                );
-                let _ = finished.send(rendered);
-            });
-            let entered = if cancel_during_wait {
-                Some(
-                    watch
-                        .recv_timeout(Duration::from_secs(2))
-                        .and_then(|entered| entered.recv_timeout(Duration::from_secs(2))),
-                )
-            } else {
-                None
-            };
-            cancellation.store(true, Ordering::Relaxed);
-            let result = completion.recv_timeout(Duration::from_secs(2));
-            let pending = library.manifests_pending();
-            // Release before the scoped join even if the regression timed out:
-            // the held job is an inline map, with no network work behind it.
-            drop(hold);
-            (result, entered, pending)
-        });
-
-        if let Some(entered) = entered {
-            entered.expect("cancellation arrived during the sample wait");
+    /// An empty render of 0.1 s through `door` to `path`.
+    fn render_through(
+        door: Door,
+        path: &Path,
+        library: Option<&SampleLibrary>,
+        stop: &RenderStop,
+    ) -> std::io::Result<()> {
+        let dispatch = rustel_audio::DspDispatch::portable();
+        match door {
+            Door::Wav => crate::render::write_scalar_wav_controlled_with_dispatch(
+                path,
+                48_000,
+                0.1,
+                &[],
+                0.5,
+                library,
+                false,
+                rustel_audio::RenderControl::default(),
+                rustel_audio::WavSampleFormat::Pcm16,
+                dispatch,
+                128,
+                None,
+                false,
+                stop,
+            )
+            .map(|_| ()),
+            Door::InMemory => crate::render::render_scalar_pcm_with_refusals(
+                48_000,
+                0.1,
+                &[],
+                0.5,
+                library,
+                dispatch,
+                128,
+                None,
+                stop,
+            )
+            .map(|_| ()),
+            #[cfg(feature = "mp3-export")]
+            Door::Mp3 => crate::render::write_scalar_mp3_with_dispatch(
+                path,
+                48_000,
+                0.1,
+                &[],
+                0.5,
+                library,
+                dispatch,
+                128,
+                None,
+                stop,
+            )
+            .map(|_| ()),
         }
-        let error = result
-            .expect("cancelled render returned while the manifest worker was held")
-            .expect_err("a stopped render is not a completed file");
-        assert_eq!(error.to_string(), rustel_audio::RENDER_CANCELLED);
-        assert!(pending > 0, "the render waited for the held manifest");
-        assert!(!path.exists(), "sample cancellation reached audio writing");
+    }
+
+    /// Each door of an empty render stops in its sample wait: a stop of the
+    /// transport gives `RENDER_CANCELLED`, and a finish gives
+    /// `RENDER_ENDED_BEFORE_AUDIO`. With no library a door has no sample
+    /// wait, and the stop ends it before its writer. No door writes a file.
+    fn assert_empty_render_stops(during_wait: bool, finish: bool) {
+        let doors = [
+            Door::Wav,
+            Door::InMemory,
+            #[cfg(feature = "mp3-export")]
+            Door::Mp3,
+        ];
+        let expected = if finish {
+            crate::render::RENDER_ENDED_BEFORE_AUDIO
+        } else {
+            rustel_audio::RENDER_CANCELLED
+        };
+        for door in doors {
+            let library = SampleLibrary::empty();
+            let hold = library.hold_manifest_worker_for_test();
+            let transport = Arc::new(Transport::default());
+            let finished_early = Arc::new(AtomicBool::new(false));
+            let stop = RenderStop {
+                transport: Some(Arc::clone(&transport)),
+                finish: Some(Arc::clone(&finished_early)),
+            };
+            let raise = || {
+                if finish {
+                    finished_early.store(true, Ordering::Relaxed);
+                } else {
+                    transport.stop();
+                }
+            };
+            if !during_wait {
+                raise();
+            }
+            let folder = tempfile::tempdir().expect("render directory");
+            let path = folder.path().join("stopped.wav");
+            let (finished, completion) = mpsc::channel();
+            let (watching, watch) = mpsc::channel();
+
+            let (result, entered, pending) = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    if during_wait {
+                        watching.send(watch_next_wait()).expect("wait observer");
+                    }
+                    let _ = finished.send(render_through(door, &path, Some(&library), &stop));
+                });
+                let entered = if during_wait {
+                    Some(
+                        watch
+                            .recv_timeout(Duration::from_secs(2))
+                            .and_then(|entered| entered.recv_timeout(Duration::from_secs(2))),
+                    )
+                } else {
+                    None
+                };
+                raise();
+                let result = completion.recv_timeout(Duration::from_secs(2));
+                let pending = library.manifests_pending();
+                // Release before the scoped join even if the regression timed out:
+                // the held job is an inline map, with no network work behind it.
+                drop(hold);
+                (result, entered, pending)
+            });
+
+            if let Some(entered) = entered {
+                entered.expect("the stop arrived during the sample wait");
+            }
+            let error = result
+                .expect("stopped render returned while the manifest worker was held")
+                .expect_err("a stopped render is not a completed file");
+            assert_eq!(error.to_string(), expected, "{door:?}");
+            assert!(
+                pending > 0,
+                "{door:?}: the render waited for the held manifest"
+            );
+            assert!(!path.exists(), "{door:?}: the stop reached audio writing");
+
+            let path = folder.path().join("no library.wav");
+            let error = render_through(door, &path, None, &stop)
+                .expect_err("a stopped render with no library is not a completed file");
+            assert_eq!(error.to_string(), expected, "{door:?} with no library");
+            assert!(!path.exists(), "{door:?}: the stop reached the writer");
+        }
     }
 
     #[test]
     fn stopped_empty_render_does_not_wait_for_sample_manifests() {
-        assert_empty_render_cancels(false);
+        assert_empty_render_stops(false, false);
     }
 
     #[test]
     fn empty_render_cancels_during_the_sample_manifest_wait() {
-        assert_empty_render_cancels(true);
+        assert_empty_render_stops(true, false);
+    }
+
+    #[test]
+    fn an_empty_render_finished_during_the_sample_manifest_wait_writes_no_file() {
+        assert_empty_render_stops(true, true);
     }
 
     #[test]

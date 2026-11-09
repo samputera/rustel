@@ -665,11 +665,7 @@ mod tests {
     /// `gm_*` voice an octave low.
     #[test]
     fn a_noteless_soundfont_defaults_an_octave_above_a_noteless_sample() {
-        let midi_for = |name: &str| {
-            let value = serde_json::json!({ "s": name });
-            let object = value.as_object().expect("object");
-            super::sample_default_midi(object, name)
-        };
+        let midi_for = super::sample_default_midi;
         assert_eq!(
             midi_for("gm_flute"),
             48.0,
@@ -2458,6 +2454,8 @@ pub fn resolve_voice_with_samples(
         sample_rate,
         cps,
         samples,
+        0,
+        0.0,
     )
     .map_err(VoiceError::into_message)
 }
@@ -2492,6 +2490,8 @@ pub fn resolve_hap_value(
         sample_rate,
         cps,
         samples,
+        0,
+        0.0,
     )
 }
 
@@ -2528,6 +2528,41 @@ pub fn resolve_voice_with_samples_detailed(
     cps: f64,
     samples: &dyn SampleLookup,
 ) -> Result<rustel_audio::OnsetEvent, VoiceError> {
+    resolve_voice_with_origin(
+        value,
+        onset_id,
+        duration_secs,
+        target_time,
+        cycle,
+        sample_rate,
+        cps,
+        samples,
+        0,
+        0.0,
+    )
+}
+
+/// [`resolve_voice_with_samples_detailed`] for a render whose file starts
+/// `origin` frames into the clock of its backend. The onset frame of the
+/// event is the frame of `target_time` plus `origin`, so a `target_time`
+/// below 0 converts while that frame is not below 0. Each time of the event
+/// stays in the time of the file. `floor` is the earliest time, in seconds,
+/// the `.stretch()` compensation moves an onset to: 0 for the first
+/// conversion of a note. With `origin` 0 and `floor` 0 this is
+/// [`resolve_voice_with_samples_detailed`].
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_voice_with_origin(
+    value: &serde_json::Value,
+    onset_id: u64,
+    duration_secs: f64,
+    target_time: f64,
+    cycle: f64,
+    sample_rate: u32,
+    cps: f64,
+    samples: &dyn SampleLookup,
+    origin: u64,
+    floor: f64,
+) -> Result<rustel_audio::OnsetEvent, VoiceError> {
     resolve_voice_at(
         value,
         onset_id,
@@ -2537,11 +2572,13 @@ pub fn resolve_voice_with_samples_detailed(
         sample_rate,
         cps,
         samples,
+        origin,
+        floor,
     )
 }
 
-/// [`resolve_voice_with_samples_detailed`] with the musical time, in seconds,
-/// in place of the cycle.
+/// [`resolve_voice_with_origin`] with the musical time, in seconds, in place
+/// of the cycle.
 #[allow(clippy::too_many_arguments)]
 fn resolve_voice_at(
     value: &serde_json::Value,
@@ -2552,6 +2589,8 @@ fn resolve_voice_at(
     sample_rate: u32,
     cps: f64,
     samples: &dyn SampleLookup,
+    origin: u64,
+    floor: f64,
 ) -> Result<rustel_audio::OnsetEvent, VoiceError> {
     // A hap value that is not an object is refused by design. A bare signal
     // head reaches this: `run(3).scale("c:major")` and `irand(7).scale(...)`
@@ -2840,6 +2879,7 @@ fn resolve_voice_at(
                         .and_then(|plugin| plugin_controls(plugin, "vsti", samples))
                         .map(clocked)
                 },
+                lead: 0,
                 lfos,
                 envs,
                 phaser: phaser_controls(object, target_time)?,
@@ -2947,12 +2987,12 @@ fn resolve_voice_at(
     // onset to frames: the reference's 40 ms, plus the frames this vocoder
     // trails a render-quantum one by, so the shifted voice lands where the
     // reference's does. Separate `.FX()` stretch stages keep their delay.
-    // A compensated onset before the render begins starts at time zero.
+    // A compensated onset before the render begins starts at `floor`.
     let source_time = target_time;
     let target_time = if value.get("stretch").is_some_and(|value| !value.is_null()) {
         let lag_secs =
             f64::from(rustel_audio::stretch::QUANTUM_LAG_FRAMES) / f64::from(sample_rate);
-        (target_time - STRETCH_LATENCY_SECS - lag_secs).max(0.0)
+        (target_time - STRETCH_LATENCY_SECS - lag_secs).max(floor)
     } else {
         target_time
     };
@@ -2967,7 +3007,9 @@ fn resolve_voice_at(
         exact_frame
     };
     let onset_frame = exact_frame.ceil();
-    if !onset_frame.is_finite() || onset_frame < 0.0 || onset_frame > u64::MAX as f64 {
+    // The origin adds whole frames after the lead, so the lead keeps its bits.
+    let framed = onset_frame + origin as f64;
+    if !framed.is_finite() || framed < 0.0 || framed > u64::MAX as f64 {
         return Err(
             format!("onset {onset_id} has an unrepresentable target time {target_time}").into(),
         );
@@ -2986,7 +3028,7 @@ fn resolve_voice_at(
         );
     }
     let event = rustel_audio::OnsetEvent::new(
-        onset_frame as u64,
+        framed as u64,
         frequency as f32,
         gain as f32,
         duration_secs as f32,
@@ -3472,6 +3514,11 @@ fn fm_controls(
     Ok(Some(rustel_audio::FmControls { operators, routes }))
 }
 
+/// The spelling the voice looks a sound up by in a bank: `{bank}_{s}`.
+pub fn banked_name(bank: &str, name: &str) -> String {
+    format!("{bank}_{name}")
+}
+
 /// The whole bank rule: `s` becomes `{bank}_{s}`.
 ///
 /// Returns `None` when there is no bank to apply, so the caller keeps the name
@@ -3485,12 +3532,12 @@ pub fn bank_prefixed(
         return Ok(None);
     }
     match object.get("bank") {
-        Some(serde_json::Value::String(bank)) => Ok(Some(format!("{bank}_{name}"))),
+        Some(serde_json::Value::String(bank)) => Ok(Some(banked_name(bank, name))),
         Some(serde_json::Value::Null) | None => Ok(None),
         Some(other) => match other.as_f64() {
             // `.bank('9000')` numerifies under miniAllStrings; the prefix
             // rule stringifies it right back.
-            Some(bank) => Ok(Some(format!("{bank}_{name}"))),
+            Some(bank) => Ok(Some(banked_name(&bank.to_string(), name))),
             _ => Err("bank must be a scalar bank name".to_owned()),
         },
     }
@@ -4020,7 +4067,7 @@ fn sample_controls(
     let plain = name;
     let name = match object.get("bank") {
         Some(serde_json::Value::String(bank)) if !name.is_empty() => {
-            banked = format!("{bank}_{name}");
+            banked = banked_name(bank, name);
             banked.as_str()
         }
         Some(serde_json::Value::Null) | None => name,
@@ -4028,7 +4075,7 @@ fn sample_controls(
             // `.bank('9000')` numerifies under miniAllStrings; the prefix
             // rule stringifies it right back.
             Some(bank) if !name.is_empty() => {
-                banked = format!("{bank}_{name}");
+                banked = banked_name(&bank.to_string(), name);
                 banked.as_str()
             }
             _ => {
@@ -4053,7 +4100,7 @@ fn sample_controls(
     // kind of sound. An ordinary sample bank falls back to midi 36; a gm_*
     // soundfont falls back to c3, which is midi 48 - the soundfont loader
     // carries its own default and it is an octave up from the sampler's.
-    let default_midi = sample_default_midi(object, name);
+    let default_midi = sample_default_midi(name);
     let midi = match object.get("freq") {
         Some(serde_json::Value::Number(freq)) => {
             let freq = freq
@@ -6103,19 +6150,13 @@ fn plugin_controls(
             return None;
         }
     };
-    let mut params = Vec::new();
-    if let Some(serde_json::Value::Object(values)) = plugin.get("params") {
-        for (key, value) in values {
-            match optional_f64(Some(value), key) {
-                Ok(Some(value)) => params.push((key.as_str(), value)),
-                Ok(None) => {}
-                Err(reason) => {
-                    skip(&reason);
-                    return None;
-                }
-            }
+    let params = match plugin_params(plugin) {
+        Ok(params) => params,
+        Err(reason) => {
+            skip(&reason);
+            return None;
         }
-    }
+    };
     let request = PluginRequest {
         instrument: call == "vsti",
         name,
@@ -6129,6 +6170,24 @@ fn plugin_controls(
             None
         }
     }
+}
+
+/// The parameter values of one plugin object of a hap, as its `params`
+/// map writes them: each key with its number. A null value is left out.
+/// `Err` gives the reason of a value that is not a finite number: the note
+/// then plays with no plugin.
+pub fn plugin_params(
+    plugin: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<(&str, f64)>, String> {
+    let mut params = Vec::new();
+    if let Some(serde_json::Value::Object(values)) = plugin.get("params") {
+        for (key, value) in values {
+            if let Some(value) = optional_f64(Some(value), key)? {
+                params.push((key.as_str(), value));
+            }
+        }
+    }
+    Ok(params)
 }
 
 /// The vowel formant table, including the unicode aliases.
@@ -7175,12 +7234,13 @@ mod unplayable_tests {
     }
 }
 
-/// The pitch a sample voice takes when the score names no note.
+/// The pitch a sample voice takes when the score names no note, by the
+/// name it looks the sound up with.
 ///
 /// An ordinary sample bank uses midi 36; a `gm_*` soundfont uses c3, midi 48,
 /// because the soundfont loader carries its own default an octave above the
 /// sampler's.
-fn sample_default_midi(_object: &serde_json::Map<String, serde_json::Value>, name: &str) -> f64 {
+pub fn sample_default_midi(name: &str) -> f64 {
     if name.starts_with("gm_") { 48.0 } else { 36.0 }
 }
 

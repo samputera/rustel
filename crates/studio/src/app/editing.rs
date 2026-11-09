@@ -285,7 +285,7 @@ impl App {
                     // is settled first: the rename must never leave a save
                     // in flight to the path the file just left.
                     self.sync_name_from_title();
-                    self.write_scene(scene, revision, Arc::clone(&source));
+                    self.write_scene(scene, Arc::clone(&source));
                 }
                 // Nothing to install: the sounding score is already this one,
                 // byte for byte. Said rather than silently dropped, because
@@ -313,7 +313,18 @@ impl App {
                 {
                     self.rebind_unchanged_score(scene, revision, Arc::clone(&source));
                     self.finish_evaluation_feedback(true);
-                    self.status = "unchanged - already playing (stop first to restart it)".into();
+                    // A plugin row with a fault: the press asks for the new
+                    // tries, and still evaluates nothing.
+                    #[cfg(feature = "vst")]
+                    let retried = self.retry_plugin_faults();
+                    #[cfg(not(feature = "vst"))]
+                    let retried = false;
+                    self.status = if retried {
+                        "unchanged - already playing · new tries asked for the plugin faults"
+                    } else {
+                        "unchanged - already playing (stop first to restart it)"
+                    }
+                    .into();
                     self.dirty_frame = true;
                     return Ok(());
                 }

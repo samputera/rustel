@@ -896,7 +896,8 @@ pub(super) fn ensure_private_dir(path: &Path) -> Result<(), String> {
 pub(crate) fn fetch_located(url: &str) -> Result<Vec<u8>, String> {
     if let Some(path) = url.strip_prefix("file://") {
         use std::io::Read;
-        let ceiling = rustel_audio::sample_pcm_ceiling();
+        let limit = FileLimit::of(url);
+        let ceiling = limit.bytes;
         let file = std::fs::File::open(path).map_err(|error| format!("read {path}: {error}"))?;
         // Ask the filesystem for the length first. One stat refuses a file
         // that is too big, and the error can state its size. Without the
@@ -905,11 +906,7 @@ pub(crate) fn fetch_located(url: &str) -> Result<Vec<u8>, String> {
         if let Some(length) = length
             && length > ceiling as u64
         {
-            return Err(format!(
-                "{path} is {}, past the {} one sound can hold",
-                rustel_audio::format_sample_bytes(length as usize),
-                rustel_audio::format_sample_bytes(ceiling)
-            ));
+            return Err(limit.refusal(Some(length)));
         }
         // The read stays bounded, because the reported length is not
         // reliable: a pipe or a device reports none (`/dev/zero` reports
@@ -928,10 +925,7 @@ pub(crate) fn fetch_located(url: &str) -> Result<Vec<u8>, String> {
         if bytes.len() > ceiling {
             // The reader stopped at the ceiling, so this one cannot say the
             // size: nothing measured it, which is the point.
-            return Err(format!(
-                "{path} is over {}, the most one sound can hold",
-                rustel_audio::format_sample_bytes(ceiling)
-            ));
+            return Err(limit.refusal(None));
         }
         return Ok(bytes);
     }
@@ -953,7 +947,7 @@ pub(super) fn fetch_cached_with_budget(
         return Ok(bytes);
     }
     let path = cache_path(dir, url);
-    if let Ok(bytes) = read_sample_cache(&path) {
+    if let Ok(bytes) = read_sample_cache(&path, FileLimit::of(url).bytes) {
         budget.check()?;
         return Ok(bytes);
     }
@@ -1175,7 +1169,8 @@ mod tests {
 
             let sample = cache_path(dir.path(), "https://samples.example/kick.wav");
             symlink(&victim, &sample).expect("plant sample symlink");
-            let error = read_sample_cache(&sample).expect_err("a sample symlink is refused");
+            let error = read_sample_cache(&sample, rustel_audio::sample_pcm_ceiling())
+                .expect_err("a sample symlink is refused");
             assert!(error.contains("not a regular file"), "{error}");
 
             let manifest = cache_path(dir.path(), "https://samples.example/kit.json");
@@ -1186,7 +1181,11 @@ mod tests {
 
             let honest = cache_path(dir.path(), "https://samples.example/snare.wav");
             std::fs::write(&honest, b"sample").expect("regular sample entry");
-            assert_eq!(read_sample_cache(&honest).expect("sample entry"), b"sample");
+            assert_eq!(
+                read_sample_cache(&honest, rustel_audio::sample_pcm_ceiling())
+                    .expect("sample entry"),
+                b"sample"
+            );
             std::fs::write(&honest, b"{}").expect("regular manifest entry");
             assert_eq!(read_manifest_cache(&honest).expect("manifest entry"), b"{}");
         }
@@ -1966,7 +1965,7 @@ mod tests {
             });
 
             let access = ScoreFetchAccess::Remote {
-                rule: SourceRule::parse(&origin.clone()).expect("a test source"),
+                sources: [SourceRule::parse(&origin.clone()).expect("a test source")].into(),
             };
             let as_json = |bytes: &[u8]| {
                 serde_json::from_slice::<serde_json::Value>(bytes)
@@ -2047,7 +2046,7 @@ mod tests {
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let url = format!("{origin}/shared-resource");
             let access = ScoreFetchAccess::Remote {
-                rule: SourceRule::parse(&origin.clone()).expect("a test source"),
+                sources: [SourceRule::parse(&origin.clone()).expect("a test source")].into(),
             };
 
             let manifest_path = cache.path(&url, ScoreCacheKind::Manifest);
@@ -2263,7 +2262,7 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("cache root");
             let url = "http://127.0.0.1:9/kick.wav";
             let access = ScoreFetchAccess::Remote {
-                rule: SourceRule::parse("http://127.0.0.1:9").expect("a test source"),
+                sources: [SourceRule::parse("http://127.0.0.1:9").expect("a test source")].into(),
             };
             let legacy = cache_path(&dir, url);
             std::fs::write(&legacy, b"legacy").expect("legacy entry");
@@ -2495,7 +2494,7 @@ mod tests {
             // A grant for a DIFFERENT origin must not reach this entry, and must
             // not fall through to the network either.
             let elsewhere = ScoreFetchAccess::Remote {
-                rule: SourceRule::parse("http://other.example").expect("a test source"),
+                sources: [SourceRule::parse("http://other.example").expect("a test source")].into(),
             };
             let error = fetch_score_source_cached(
                 &cache,
@@ -2511,7 +2510,8 @@ mod tests {
             // The matching grant does read it, which is what proves the entry was
             // reachable all along and policy is what withheld it.
             let granted = ScoreFetchAccess::Remote {
-                rule: SourceRule::parse("http://granted.example").expect("a test source"),
+                sources: [SourceRule::parse("http://granted.example").expect("a test source")]
+                    .into(),
             };
             assert_eq!(
                 fetch_score_source_cached(
@@ -2542,7 +2542,7 @@ mod tests {
             std::fs::create_dir_all(cache.dir()).expect("score cache");
             std::fs::write(cache.path(url, ScoreCacheKind::Audio), b"cached audio").expect("seed");
             let access = ScoreFetchAccess::Remote {
-                rule: SourceRule::parse("http://127.0.0.1:9").expect("a test source"),
+                sources: [SourceRule::parse("http://127.0.0.1:9").expect("a test source")].into(),
             };
             assert_eq!(
                 fetch_score_source_cached(&cache, url, &access, ScoreCacheKind::Audio, 1024, |b| {
@@ -2596,7 +2596,7 @@ mod tests {
             });
 
             let access = ScoreFetchAccess::Remote {
-                rule: SourceRule::parse(&origin.clone()).expect("a test source"),
+                sources: [SourceRule::parse(&origin.clone()).expect("a test source")].into(),
             };
             let first = fetch_score_source_cached(
                 &cache,
@@ -2638,8 +2638,9 @@ mod tests {
             ] {
                 let parsed = Url::parse(target).expect("test url");
                 let access = ScoreFetchAccess::Remote {
-                    rule: SourceRule::parse(&parsed.origin().ascii_serialization())
-                        .expect("a test source"),
+                    sources: [SourceRule::parse(&parsed.origin().ascii_serialization())
+                        .expect("a test source")]
+                    .into(),
                 };
                 let error = fetch_score_source_cached(
                     &cache,
@@ -2714,17 +2715,62 @@ mod tests {
             });
             let parsed = Url::parse(&redirect_url).expect("redirect URL");
             let access = ScoreFetchAccess::Remote {
-                rule: SourceRule::parse(&parsed.origin().ascii_serialization())
-                    .expect("a test source"),
+                sources: [SourceRule::parse(&parsed.origin().ascii_serialization())
+                    .expect("a test source")]
+                .into(),
             };
             let error = fetch_score_source(&redirect_url, &access, 1024)
                 .expect_err("score fetch must stop at a cross-origin redirect");
             server.join().expect("redirect server");
-            assert!(error.contains("outside the allowed source"), "{error}");
+            assert!(error.contains("is not an allowed sample source"), "{error}");
             assert!(
                 matches!(destination.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
                 "the redirect target received a request"
             );
+        }
+
+        /// A redirect to an address another allowed source allows is
+        /// followed, as GitHub's `/raw/` links redirect to another host. The
+        /// score could name that address itself.
+        #[test]
+        fn a_redirect_may_reach_another_allowed_source() {
+            use std::io::Write;
+            use std::net::TcpListener;
+
+            let destination = TcpListener::bind("127.0.0.1:0").expect("destination listener");
+            let destination_origin = format!("http://{}", destination.local_addr().unwrap());
+            let redirect = TcpListener::bind("127.0.0.1:0").expect("redirect listener");
+            let redirect_origin = format!("http://{}", redirect.local_addr().unwrap());
+            let location = format!("{destination_origin}/payload");
+            let server = std::thread::spawn(move || {
+                let (mut first, _) = redirect.accept().expect("redirect request");
+                drain_request_head(&first);
+                write!(
+                    first,
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("redirect response");
+                let (mut second, _) = destination.accept().expect("payload request");
+                drain_request_head(&second);
+                write!(
+                    second,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nRIFF"
+                )
+                .expect("payload response");
+            });
+            let mut policy = ScoreSampleAccess::denied();
+            policy
+                .permit_source(&redirect_origin)
+                .expect("first source");
+            policy
+                .permit_source(&destination_origin)
+                .expect("second source");
+            let (url, access) = policy
+                .approve_remote(&format!("{redirect_origin}/map"))
+                .expect("an allowed address");
+            let bytes = fetch_score_source(&url, &access, 1024).expect("the second source");
+            server.join().expect("servers");
+            assert_eq!(bytes, b"RIFF");
         }
 
         #[test]
@@ -2752,8 +2798,9 @@ mod tests {
             });
             let parsed = Url::parse(&url).expect("sample URL");
             let access = ScoreFetchAccess::Remote {
-                rule: SourceRule::parse(&parsed.origin().ascii_serialization())
-                    .expect("a test source"),
+                sources: [SourceRule::parse(&parsed.origin().ascii_serialization())
+                    .expect("a test source")]
+                .into(),
             };
             let bytes = fetch_score_source(&url, &access, 1024).expect("same-origin redirect");
             server.join().expect("sample server");

@@ -293,7 +293,9 @@ freesound sounds that shared scores name. They have no row on the page. With
 When a score loads a file that no source allows, the score plays without the
 file. The folder of the file comes onto the Permissions page as `samples off`.
 Press Enter to allow the folder and all addresses below it. Space turns a
-source off or on, and `d` removes it.
+source off or on, and `d` removes it. A source turned off or removed takes
+the banks it allowed, and their files no longer load. Packs you imported in
+Settings stay.
 
 Press `e` to edit a source. The text sets what the source allows:
 
@@ -316,8 +318,8 @@ is set. Press Enter to choose the folder, and `d` to forget it. With
 
 Studio keeps the sources and the folder in `studio.json`. If an update
 stopped on a refusal, it runs again when you give the permission. Otherwise
-the next update reads with the new permission. A redirect must stay inside
-the source that allowed the address. See
+the next update reads with the new permission. A redirect must reach an
+address that an allowed source allows. See
 [Sample access](../SECURITY.md#sample-access) for the rules.
 
 ## Checking and playback
@@ -620,10 +622,11 @@ confirmation before deleting a file. An alias must not replace an existing
 bank name. See [local samples](local-samples.md) for folder names, bank aliases,
 and stable sample order.
 
-The disk cache stores downloaded files. It is separate from decoded samples
-held in memory. Use the Samples settings to fetch imports, cache samples, or
-clear the disk cache. Clearing the cache requires confirmation. A later use
-can download the files again.
+The disk cache stores downloaded files and their decoded sound. The decoded
+sound takes 2 GiB at most, and the oldest goes first. The cache is separate
+from decoded samples held in memory. Use the Samples settings to fetch
+imports, cache samples, or clear the disk cache. Clearing the cache requires
+confirmation. A later use can download the files again.
 
 ## Sliders
 
@@ -783,6 +786,13 @@ The View menu opens the two visuals docks. Use `e` to change a dock's edge and
 `+` or `-` to resize it. Use its controls to choose a scope, spectrum, events,
 mixer, or another visual. Follow the footer for actions in the selected view.
 
+A video widget plays a video sample's picture in its slot. Use the arrows to
+pick which clip feeds it, from every video the set sounds. Press Enter and the
+clip opens a window of its own on the desktop, in sync with the sound, and the
+widget folds to a note. Press Enter again, or close the window, and the clip
+comes back to the dock. Windows are placed and sized by hand, one per clip,
+and none of it outlives the studio.
+
 Scores can also contain inline visualizers. Use the visualizers switch in
 Settings, or View > Inline visualizers, to show or hide them. Bind a key for
 Inline visualizers on the Settings > Keybinds page. Visual settings control
@@ -795,13 +805,17 @@ Press Ctrl+T to choose a theme. Type to search, use arrows to select, and press
 Enter to keep the selection. Ctrl+N creates a user theme. Ctrl+E edits one; an
 edit to a built-in theme creates a user copy. Ctrl+D asks to delete a user theme.
 
+The theme documents, except rustel-dark, and the Rust that draws them, live in
+[rustel-studio-themes](https://github.com/tzfm/rustel-studio-themes).
+The default build includes the extra documents. A build without the `themes` feature keeps `rustel-dark`.
+
 User themes are JSON files in `<rustel-config>/themes/`. `--theme` accepts a
 theme name or a path to a theme file, such as `--theme ./midnight.json`. You
 can list themes or select one at startup:
 
 ```sh
 rustel studio --list-themes
-rustel studio --theme strudel song.strudel
+rustel studio --theme rustel-dark song.strudel
 ```
 
 ### Minimal user theme
@@ -1222,7 +1236,8 @@ turns them off. The status names the folder, because the take lands inside it.
 
 Press Ctrl+Shift+X again to end an export early. Studio adds a fade and keeps
 the audio already rendered. Use Transport ▸ Reveal last export or take to
-locate it.
+locate it. Before the first frame of audio, while Studio prepares the export,
+the same keys end it with no file.
 See [CLI export](cli.md#export) for command-line options.
 
 ## Log

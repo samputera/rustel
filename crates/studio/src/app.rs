@@ -201,6 +201,7 @@ mod replay_edit;
 mod replay_pointer;
 mod replay_tabs;
 mod sample_delete;
+mod sample_details;
 mod sample_import;
 mod sample_sources;
 mod scene_strip;
@@ -214,6 +215,8 @@ mod stage_pixels;
 mod string_roles;
 mod theme_sheets;
 mod transport;
+#[cfg(feature = "video")]
+pub mod video_window;
 mod vim;
 mod viz_panel;
 #[cfg(feature = "vst")]
@@ -241,7 +244,7 @@ use pointer_shape::{SHAPE_DEFAULT, SHAPE_GRABBING, SHAPE_POINTER, SHAPE_TEXT};
 use prebakes::PrebakeRequest;
 #[cfg(feature = "hydra")]
 use previews::SnippetPreview;
-use previews::{PREVIEW_STOP_WINDOW, nudge_preview_gain};
+use previews::nudge_preview_gain;
 use prompt_paste::{
     MAX_RAW_PASTE_KEY_EVENTS_PER_TURN, MAX_RAW_PASTE_TERMINAL_EVENTS_PER_TURN, poll_after_input,
     read_raw_paste_chunk,
@@ -258,7 +261,7 @@ use replay_tabs::SetStash;
 use sample_import::dropped_paths;
 use sample_sources::{
     ShippedSource, SourceMeasurement, SourceRefresh, UserSource, sample_source_folder,
-    status_sample_source, status_sample_source_error,
+    status_sample_failure, status_sample_source, status_sample_source_error,
 };
 use sessions::TAPE_GESTURE_SETTLE;
 use sets::{SetPrompt, SetSwitch};
@@ -624,6 +627,7 @@ fn run_once(mut options: StudioOptions) -> Result<Session, RuntimeError> {
     // against, and a set that opens with a long sample in it must not have
     // it declined on the way in.
     rustel_audio::set_sample_pcm_ceiling(sample_settings.sample_ceiling.bytes());
+    rustel_runtime::set_video_file_ceiling(sample_settings.video_ceiling.bytes());
     let worker = StudioWorker::spawn(
         StudioConfig {
             session: options
@@ -841,6 +845,11 @@ struct App {
     worker: StudioWorker,
     save_worker: SaveWorker,
     visual: VisualState,
+    /// The detached video windows, one per clip the video widgets have
+    /// sent to the desktop. Attached is the default: a window exists
+    /// only while the player keeps it, and nothing of it persists.
+    #[cfg(feature = "video")]
+    video_windows: Vec<video_window::VideoWindow>,
     /// One or two panes, left to right. The focused one holds the caret and
     /// is always the set's current scene.
     panes: Vec<Pane>,
@@ -1417,8 +1426,13 @@ struct App {
     /// Tabs by most recent visit, and material last accepted by the engine.
     scene_visits: Vec<SceneId>,
     tabs_closed: u64,
+    /// The id of each tab that left, in order: see
+    /// [`LiveMaterial::closed_documents`].
+    closed_documents: Vec<u64>,
     live_material_sent: Option<Vec<(SceneId, LiveTextMark, bool)>>,
     tabs_closed_sent: u64,
+    /// How many of [`Self::closed_documents`] the engine accepted.
+    closed_documents_sent: usize,
     plugins_shown_sent: Vec<String>,
     setups_select_variants_sent: bool,
     sent_setup_selected_variants: bool,
@@ -1524,6 +1538,9 @@ struct App {
     /// while it is still `None`: a sound heard for the first time is being
     /// decoded at the moment it is asked for.
     preview_shape: Option<(std::sync::Arc<[u8]>, f64)>,
+    /// The read of the samples tab's selected file for its details, while
+    /// one is out.
+    details_read: Option<sample_details::DetailsRead>,
     /// How long the studio has had sound, in seconds, and when that was
     /// last counted.
     ///
@@ -1685,6 +1702,8 @@ impl App {
             worker,
             save_worker,
             visual,
+            #[cfg(feature = "video")]
+            video_windows: Vec::new(),
             panes: vec![Pane {
                 scene: first_scene,
                 last_map: None,
@@ -1940,8 +1959,10 @@ impl App {
             launch_pads_sent: None,
             scene_visits: Vec::new(),
             tabs_closed: 0,
+            closed_documents: Vec::new(),
             live_material_sent: None,
             tabs_closed_sent: 0,
+            closed_documents_sent: 0,
             plugins_shown_sent: Vec::new(),
             setups_select_variants_sent: false,
             sent_setup_selected_variants: false,
@@ -1976,6 +1997,7 @@ impl App {
             preview_armed: None,
             preview_lit_until: None,
             preview_shape: None,
+            details_read: None,
             sound_seconds: std::cell::Cell::new(0.0),
             sound_counted_at: std::cell::Cell::new(Instant::now()),
             #[cfg(feature = "hydra")]
@@ -2329,6 +2351,7 @@ impl App {
         self.live_sliders.remove(&id);
         self.readiness.remove(&id);
         self.tabs_closed += 1;
+        self.closed_documents.push(id.0);
     }
 
     fn live_tabs(&self) -> Vec<(SceneId, bool)> {
@@ -2379,6 +2402,7 @@ impl App {
         let plugins = Vec::new();
         if (self.live_material_sent.as_ref() == Some(&key)
             && self.tabs_closed_sent == self.tabs_closed
+            && self.closed_documents_sent == self.closed_documents.len()
             && self.plugins_shown_sent == plugins)
             || now.duration_since(self.last_edit_at) < LINT_DEBOUNCE
         {
@@ -2410,6 +2434,7 @@ impl App {
                 .filter_map(|(id, _, _)| text(*id))
                 .collect(),
             tabs_closed: self.tabs_closed,
+            closed_documents: self.closed_documents.clone(),
             setups_select_variants,
             plugins: plugins.clone(),
         };
@@ -2438,6 +2463,7 @@ impl App {
         load_variants_ahead(&ahead, setups_select_variants, &library);
         self.live_material_sent = Some(key);
         self.tabs_closed_sent = self.tabs_closed;
+        self.closed_documents_sent = material.closed_documents.len();
         self.plugins_shown_sent = plugins;
         self.setups_select_variants_sent = setups_select_variants;
     }
@@ -2466,31 +2492,21 @@ mod tests {
         use super::super::*;
 
         #[test]
-        fn successful_save_hides_parent_folders_unless_enabled() {
+        fn a_save_that_lands_says_nothing() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = super::support::app_over(directory.path());
             let path = app.scenes.current().path.clone();
-            assert!(!app.ui_settings.show_full_paths);
+            app.status = "playing from the top".into();
             for full in [false, true] {
                 app.ui_settings.show_full_paths = full;
                 app.handle_save_result(SaveResult {
                     request_id: 42,
                     path: path.clone(),
-                    editor_revision: app.editor().revision(),
                     source_revision: source_revision(&app.editor().source()),
                     result: Ok(true),
                 });
-                let expected = if full {
-                    format!("saved {}", path.display())
-                } else {
-                    "saved first.strudel".to_owned()
-                };
-                assert_eq!(app.status, expected);
-                let deadline = app.status_notice.as_ref().expect("save notice").1;
-                app.expire_notice(deadline - Duration::from_millis(1));
-                assert_eq!(app.status, expected);
-                app.expire_notice(deadline);
-                assert!(app.status.is_empty());
+                assert_eq!(app.status, "playing from the top", "the line is left alone");
+                assert!(app.status_notice.is_none(), "and no notice is raised");
             }
         }
 
@@ -3312,7 +3328,8 @@ mod tests {
 
         /// A closed tab holds nothing: its lint, its sliders, its readiness
         /// and its place among the visits go with it, and the count of tabs
-        /// let go moves, which is what has the engine sweep its sounds.
+        /// let go moves, which is what has the engine sweep its sounds. Its
+        /// id joins the closed documents, so the engine closes its scene.
         #[test]
         fn closing_a_scene_forgets_it() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -3327,6 +3344,7 @@ mod tests {
             assert!(app.scenes.get(closed).is_none(), "closed: {}", app.status);
             assert!(!holds_anything_of(&app, closed));
             assert_eq!(app.tabs_closed, before + 1);
+            assert_eq!(app.closed_documents, [closed.0]);
             assert!(!app.status.contains("pad"), "{}", app.status);
         }
 
@@ -3460,10 +3478,13 @@ mod tests {
             assert!(!path.exists(), "deleted: {}", app.status);
             assert!(!holds_anything_of(&app, deleted));
             assert_eq!(app.tabs_closed, before + 1);
+            assert_eq!(app.closed_documents, [deleted.0]);
         }
 
         /// A set put down takes every tab with it, and what was kept for each
-        /// goes whole - as one move of the count, not one per tab.
+        /// goes whole, as one move of the count, not one per tab. The id of
+        /// each score tab joins the closed documents. A setup tab has no
+        /// document.
         #[test]
         fn switching_sets_forgets_every_tab_of_the_old_one() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -3474,6 +3495,8 @@ mod tests {
             for id in [first, second] {
                 remember_something_of(&mut app, id);
             }
+            app.open_prebake(PrebakeScope::Local);
+            assert!(app.scenes.current().prebake().is_some(), "{}", app.status);
             let before = app.tabs_closed;
 
             let elsewhere = tempfile::tempdir().expect("second set");
@@ -3486,6 +3509,7 @@ mod tests {
                 assert!(!holds_anything_of(&app, id), "{id:?}");
             }
             assert_eq!(app.tabs_closed, before + 1);
+            assert_eq!(app.closed_documents, [first.0, second.0]);
             assert_eq!(
                 app.scene_visits,
                 [app.scenes.current().id],
@@ -3530,7 +3554,8 @@ mod tests {
         /// A tape's tab is not live material, so closing one leaves the tabs
         /// the engine was sent as they were. The count of tabs let go is sent
         /// on its own, or what only the tape played would wait out a sweep
-        /// that had already run.
+        /// that had already run. The id of the tape goes with the count, so
+        /// the engine closes its scene.
         #[test]
         fn closing_a_tape_is_news_to_the_engine() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -3541,6 +3566,7 @@ mod tests {
             let tape = write_tape(&tapes, "2026-09-05T12-09-48", &[(0.0, "$: s(\"bd\")")]);
             app.open_replay_tab(&tape);
             assert!(app.scenes.current().is_replay(), "{}", app.status);
+            let replay = app.scenes.current().id;
             let later = Instant::now() + LINT_DEBOUNCE;
             app.sync_live_material(later);
             let sent = app.live_material_sent.clone().expect("the tabs were sent");
@@ -3553,6 +3579,11 @@ mod tests {
             assert_eq!(
                 app.tabs_closed_sent, app.tabs_closed,
                 "and the tape leaving went with them"
+            );
+            assert_eq!(app.closed_documents, [replay.0]);
+            assert_eq!(
+                app.closed_documents_sent, 1,
+                "the id of the tape went with them"
             );
         }
 

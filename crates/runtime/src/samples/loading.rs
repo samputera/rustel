@@ -269,7 +269,8 @@ fn run_sample_loader(shared: Weak<Shared>, jobs: Arc<LoadQueue>, dir: PathBuf) {
             .lock()
             .expect("loading sample")
             .insert(Arc::clone(&url));
-        let budget = sample_fetch::FetchBudget::for_one_fetch_with_cancellation(
+        let budget = sample_fetch::FetchBudget::for_transfer(
+            FileLimit::of(&url).bytes,
             shared.publication.cancellation(),
         );
         let LoadKind::Install { id, decode_rate } = kind else {
@@ -308,7 +309,7 @@ fn run_sample_loader(shared: Weak<Shared>, jobs: Arc<LoadQueue>, dir: PathBuf) {
                 &url,
                 &access,
                 ScoreCacheKind::Audio,
-                rustel_audio::sample_pcm_ceiling(),
+                FileLimit::of(&url).bytes,
                 CacheFetchScope {
                     budget: &budget,
                     publication: &shared.publication,
@@ -582,11 +583,16 @@ impl SampleLibrary {
             global_generation: std::sync::atomic::AtomicU64::new(0),
             global_source_of: RwLock::new(HashMap::new()),
             import_policy: Mutex::new(None),
+            score_policy: Mutex::new(None),
             font_jobs: Arc::clone(&font_jobs),
             failures: Mutex::new(Vec::new()),
             direct_diagnostic_logging: AtomicBool::new(
                 rustel_voice::default_direct_diagnostic_logging(),
             ),
+            #[cfg(feature = "video")]
+            videos: Mutex::new(HashMap::new()),
+            #[cfg(feature = "video")]
+            video_ceiling_seen: AtomicU64::new(file_limit::video_ceiling_moves()),
             score_cache: ScoreCache::new(dir.clone()),
             manifest_pending: AtomicUsize::new(0),
             publication,
@@ -1114,27 +1120,26 @@ impl SampleLibrary {
     /// the deadline passes. Prefetch/offline convenience; the live path
     /// never waits.
     pub fn wait_until_idle(&self, deadline: std::time::Duration) {
-        self.wait_until_idle_cancellable(deadline, None);
+        self.wait_until_idle_cancellable(deadline, || false);
     }
 
-    /// The offline wait with an optional host stop flag. Stopping this wait
-    /// leaves the library and its background loaders available to the host.
+    /// The offline wait with a stop of the host: the wait returns once
+    /// `stop` gives true. Stopping this wait leaves the library and its
+    /// background loaders available to the host.
     pub(crate) fn wait_until_idle_cancellable(
         &self,
         deadline: std::time::Duration,
-        cancelled: Option<&AtomicBool>,
+        stop: impl Fn() -> bool,
     ) {
         let started = std::time::Instant::now();
         // A plugin a score named loads on the plugin thread. The wait has
-        // the same deadline and the same stop flag as the samples.
+        // the same deadline and the same stop as the samples.
         #[cfg(feature = "vst")]
         if let Some(plugins) = crate::vst::started() {
-            plugins.wait_idle_within(deadline, || {
-                cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
-            });
+            plugins.wait_idle_within(deadline, &stop);
         }
         loop {
-            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            if stop() {
                 return;
             }
             // A manifest job starts its owned preloads before release-publishing
@@ -1800,7 +1805,7 @@ pub(super) mod tests {
             let error =
                 fetch_located("file:///dev/zero").expect_err("an endless file must be refused");
             assert!(
-                error.contains("the most one sound can hold"),
+                error.contains(" sound limit"),
                 "the refusal did not name the size limit: {error}"
             );
             // And it says the ceiling in the units a reader thinks in, so a
@@ -1823,7 +1828,7 @@ pub(super) mod tests {
                 .expect("fixture");
             let error = fetch_located(&format!("file://{}", big.display()))
                 .expect_err("a file past the ceiling must be refused");
-            assert!(error.contains("past the"), "{error}");
+            assert!(error.contains(" is over the "), "{error}");
             assert!(
                 error.contains(&rustel_audio::format_sample_bytes(
                     rustel_audio::MIN_SAMPLE_PCM_BYTES + 1
@@ -2243,9 +2248,14 @@ pub(super) mod tests {
                 global_generation: std::sync::atomic::AtomicU64::new(0),
                 global_source_of: RwLock::new(HashMap::new()),
                 import_policy: Mutex::new(None),
+                score_policy: Mutex::new(None),
                 font_jobs: FontQueue::new(),
                 failures: Mutex::new(Vec::new()),
                 direct_diagnostic_logging: AtomicBool::new(true),
+                #[cfg(feature = "video")]
+                videos: Mutex::new(HashMap::new()),
+                #[cfg(feature = "video")]
+                video_ceiling_seen: AtomicU64::new(0),
                 score_cache: ScoreCache::new(cache_dir()),
                 manifest_pending: AtomicUsize::new(0),
                 publication: Arc::new(PublicationGate::new()),
