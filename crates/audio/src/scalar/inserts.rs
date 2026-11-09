@@ -1836,32 +1836,34 @@ impl ScalarBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AudioBackend, InsertControls, InsertKey, OrbitInsert};
+    use std::sync::{Arc, Mutex};
+
+    /// A copy that renders ahead and holds each early score until it is cancelled.
+    struct Scheduled {
+        key: InsertKey,
+        notes: Arc<Mutex<Vec<(u64, u32)>>>,
+    }
+
+    impl OrbitInsert for Scheduled {
+        fn key(&self) -> InsertKey {
+            self.key
+        }
+        fn set_param(&mut self, _: crate::InsertParam, _: u32) {}
+        fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
+        fn renders_ahead(&self) -> bool {
+            true
+        }
+        fn score(&mut self, id: u64, frames: u32) {
+            self.notes.lock().unwrap().push((id, frames));
+        }
+        fn cancel_score(&mut self, id: u64) {
+            self.notes.lock().unwrap().retain(|(held, _)| *held != id);
+        }
+    }
 
     #[test]
     fn retiring_prefetched_scores_cancels_only_replaced_onsets() {
-        use crate::{AudioBackend, InsertControls, InsertKey, OrbitInsert};
-        use std::sync::{Arc, Mutex};
-
-        struct Scheduled {
-            key: InsertKey,
-            notes: Arc<Mutex<Vec<(u64, u32)>>>,
-        }
-        impl OrbitInsert for Scheduled {
-            fn key(&self) -> InsertKey {
-                self.key
-            }
-            fn set_param(&mut self, _: crate::InsertParam, _: u32) {}
-            fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
-            fn renders_ahead(&self) -> bool {
-                true
-            }
-            fn score(&mut self, id: u64, frames: u32) {
-                self.notes.lock().unwrap().push((id, frames));
-            }
-            fn cancel_score(&mut self, id: u64) {
-                self.notes.lock().unwrap().retain(|(held, _)| *held != id);
-            }
-        }
         for location in 0..3 {
             let key = InsertKey {
                 plugin: u32::MAX,
@@ -1927,6 +1929,46 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn retiring_an_onset_of_a_chain_with_latency_cancels_its_early_score() {
+        // A note of a chain with latency is aimed its lead before its musical
+        // onset. The handoff retires it by its musical onset, so its early
+        // score goes too.
+        const LEAD: u64 = 480;
+        let key = InsertKey {
+            plugin: u32::MAX,
+            preset: 1,
+        };
+        let notes = Arc::new(Mutex::new(Vec::with_capacity(4)));
+        let mut backend = ScalarBackend::prepared(48_000, 16).unwrap();
+        assert!(
+            backend
+                .install_insert(
+                    crate::instrument_slot(1),
+                    Box::new(Scheduled {
+                        key,
+                        notes: Arc::clone(&notes),
+                    })
+                )
+                .is_none()
+        );
+        // Note 1 sounds before the takeover at 640, note 2 on it and note 3
+        // after it.
+        for (id, musical) in [(1, 608), (2, 640), (3, 1280)] {
+            let mut event: OnsetEvent =
+                OnsetEvent::new(musical - LEAD, 65.4, 0.9, 0.025).with_generation(1);
+            event.controls.insert_chain = Some(1);
+            event.controls.lead = LEAD as u32;
+            event.controls.instrument = Some(InsertControls::new(key).with_score(id));
+            backend.notify_inserts_early(&event, 0);
+            backend.note(event);
+        }
+        backend.hand_over_from(2, 640, 0);
+        let held: Vec<u64> = notes.lock().unwrap().iter().map(|(id, _)| *id).collect();
+        assert_eq!(held, [1], "a retired onset kept its early score");
+    }
+
     mod insert_routing_tests {
         use super::*;
         use crate::insert::{InsertControls, InsertKey, InsertNote, InsertParam, OrbitInsert};

@@ -1411,7 +1411,8 @@ impl ScalarBackend {
 
     /// Retire every pending onset whose musical onset is at or after the
     /// frame `horizon` names for its generation, reporting each as
-    /// superseded, and sync the clock to `at_frame`. A note of a plugin chain
+    /// superseded and retracting its early score from the inserts that render
+    /// ahead, and sync the clock to `at_frame`. A note of a plugin chain
     /// with latency is aimed its lead before its musical onset, so its target
     /// is at times before the horizon. A borrowed closure over a fixed pool:
     /// nothing allocates.
@@ -1419,12 +1420,18 @@ impl ScalarBackend {
     /// A voice is never retired here, also not an SBD voice whose graph runs
     /// ahead of its source: see [`Self::keep_started_onsets`].
     fn retire_pending_by(&mut self, at_frame: u64, horizon: impl Fn(u64) -> u64) {
+        let retires = |event: &OnsetEvent<CompactKabelControls>| {
+            !event.controls.piano
+                && event.controls.musical(event.onset_frame) >= horizon(event.generation)
+        };
         for position in 0..self.pending.order.len() {
             let index = self.pending.order[position];
-            if let Some(event) = self.pending.slots[index].event
-                && !event.controls.piano
-                && event.onset_frame >= horizon(event.generation)
-            {
+            let event = self.pending.slots[index]
+                .event
+                .as_ref()
+                .filter(|event| retires(event))
+                .copied();
+            if let Some(event) = event {
                 self.cancel_inserts_early(&event);
             }
         }
@@ -1432,8 +1439,7 @@ impl ScalarBackend {
         let confirmations = &mut self.confirmations;
         self.pending
             .retain_with_confirmation(|event, confirmation, _| {
-                let musical = event.controls.musical(event.onset_frame);
-                let keep = event.controls.piano || musical < horizon(event.generation);
+                let keep = !retires(event);
                 #[cfg(feature = "device-audio")]
                 if !keep && let (Some(consumer), Some(tag)) = (&mut *confirmations, confirmation) {
                     consumer.superseded(tag);
