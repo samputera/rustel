@@ -27,7 +27,7 @@
 - Fixed: a terminal that answers Kitty pictures no longer types its answers into the score, and Edit ▸ Find chosen with a click takes typing.
 - Fixed: in Vim mode, a key in a search box cancels a pending delete, `p` handles a Unicode line separator, and a pick on an opening quote writes inside the string.
 - Fixed: a Hydra callback with a round number such as `mouse.x / 3000` compiles.
-- Fixed: old Csound notes briefly sounding again when editing a playing pattern.
+- Fixed: an edit of a playing Csound pattern no longer plays the old notes it replaces, unless Csound already started them.
 
 ### Sound changes
 

@@ -82,11 +82,13 @@ session. A definition-only evaluation works too. A syntax or compile error
 leaves the last accepted score and orchestra playing. Studio export retains
 the accepted definitions, including instruments from an earlier evaluation.
 
-Updating a pattern retracts its queued Csound onsets individually and preserves
-notes that have already started rendering. Csound renders a short audio runway
-ahead of playback. A late update cannot retract notes already mixed into that
-runway or move a replacement onset behind it back to its original frame.
-Cancellation does not restart the orchestra or erase its global values.
+An update replaces the old pattern's Csound notes from the point it takes
+effect. Old notes Csound has not started are dropped, and notes it started
+play out. Csound renders up to 512 frames ahead of playback, about 11 ms at
+48 kHz, so it can start a note before you hear it. A new note due in frames
+Csound already rendered starts late, on the first frame it has not rendered.
+Dropping the old notes does not restart the orchestra or reset its global
+values.
 
 An orchestra edit or export starts fresh engines. It does not retain running
 notes or the previous engine's global values. In play, the previous engine
